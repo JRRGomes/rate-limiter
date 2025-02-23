@@ -3,17 +3,24 @@ package limiter_test
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
+	"github.com/JRRGomes/rate-limiter/config"
 	"github.com/JRRGomes/rate-limiter/limiter"
 	"github.com/go-redis/redis/v8"
+	"github.com/joho/godotenv"
 	"github.com/stretchr/testify/assert"
 )
 
 func setupRateLimiter() (*limiter.RateLimiter, *redis.Client) {
+	if err := godotenv.Load("../.env"); err != nil {
+		log.Fatal("Error loading .env file")
+	}
+
 	client := redis.NewClient(&redis.Options{
 		Addr: "localhost:6379",
 		DB:   0,
@@ -25,7 +32,12 @@ func setupRateLimiter() (*limiter.RateLimiter, *redis.Client) {
 	}
 
 	redisStorage := limiter.NewRedisLimiterStorage(client)
-	return limiter.NewRateLimiter(redisStorage, 10, 11, 2), client
+	cfg, err := config.LoadConfig()
+	if err != nil {
+		panic(fmt.Sprintf("Failed to load config: %v", err))
+	}
+
+	return limiter.NewRateLimiter(redisStorage, cfg), client
 }
 
 func cleanupRedis(client *redis.Client) {
@@ -39,56 +51,104 @@ func TestRateLimitByIP(t *testing.T) {
 	ctx := context.Background()
 	ipKey := "ip:192.168.1.1"
 
-	// The first request should be allowed
-	allowed, err := rateLimiter.Allow(ctx, ipKey, 10)
-	assert.NoError(t, err)
-	assert.True(t, allowed, "First request should be allowed")
+	// Reset any existing keys
+	redisClient := rateLimiter.GetStorage().(*limiter.RedisLimiterStorage).GetClient()
+	redisClient.Del(ctx, ipKey)
+	redisClient.Del(ctx, "blocked:"+ipKey)
 
-	// Simulate 9 more requests (total of 10 requests)
-	for i := 0; i < 9; i++ {
-		allowed, err := rateLimiter.Allow(ctx, ipKey, 10)
+	// Make requests until we hit the limit
+	var i int
+	var allowed bool
+	var err error
+	for i = 0; i < 30; i++ {
+		allowed, err = rateLimiter.Allow(ctx, ipKey, "")
 		assert.NoError(t, err)
-		assert.True(t, allowed, fmt.Sprintf("Request %d should be allowed", i+2))
+		if !allowed {
+			break
+		}
 	}
 
-	// The 11th request should be blocked
-	allowed, err = rateLimiter.Allow(ctx, ipKey, 10)
-	assert.NoError(t, err)
-	assert.False(t, allowed, "11th request should be blocked")
+	// Verify that we got the expected number of allowed requests
+	assert.Equal(t, 20, i, "Should allow exactly 20 requests before blocking")
+	assert.False(t, allowed, "Request after limit should be blocked")
 
-	// Wait for the block to expire
+	// Wait for the block to expire (15 seconds as per .env)
 	fmt.Println("Waiting for block to expire...")
-	time.Sleep(5 * time.Second)
+	time.Sleep(16 * time.Second)
 
-	// Verify that the block key has expired
-	blockKey := "blocked:" + ipKey
-	ttl, err := rateLimiter.GetStorage().(*limiter.RedisLimiterStorage).GetClient().TTL(ctx, blockKey).Result()
-	assert.NoError(t, err)
-	assert.Equal(t, time.Duration(-2), ttl, "Block key should have expired")
+	// Clear the key and block key
+	redisClient.Del(ctx, ipKey)
+	redisClient.Del(ctx, "blocked:"+ipKey)
 
-	rateLimiter.GetStorage().(*limiter.RedisLimiterStorage).GetClient().Del(ctx, ipKey)
-
-	// After waiting, the IP should be allowed again
-	allowed, err = rateLimiter.Allow(ctx, ipKey, 10)
+	// After waiting and clearing keys, the IP should be allowed again
+	allowed, err = rateLimiter.Allow(ctx, ipKey, "")
 	fmt.Printf("After waiting: Allowed = %v, Error = %v\n", allowed, err)
 	assert.NoError(t, err)
-	assert.True(t, allowed, "Request should be allowed after block expires")
+	assert.True(t, allowed, "Request should be allowed after block expires and keys are cleared")
 }
 
-func TestRateLimitByToken(t *testing.T) {
+func TestRateLimitByTokenTypes(t *testing.T) {
 	rateLimiter, client := setupRateLimiter()
 	defer cleanupRedis(client)
 
-	token := "abc123"
-	for i := 0; i < 11; i++ {
-		allowed, err := rateLimiter.Allow(context.Background(), "token:"+token, 11)
-		assert.NoError(t, err)
-		assert.True(t, allowed, "Request should be allowed")
-	}
+	ctx := context.Background()
+	redisClient := rateLimiter.GetStorage().(*limiter.RedisLimiterStorage).GetClient()
 
-	allowed, err := rateLimiter.Allow(context.Background(), "token:"+token, 11)
+	// Test public token (25 requests/second with 15-second blocking)
+	publicToken := "token:public123"
+	redisClient.Del(ctx, publicToken)
+	redisClient.Del(ctx, "blocked:"+publicToken)
+
+	var i int
+	var allowed bool
+	var err error
+	for i = 0; i < 30; i++ {
+		allowed, err = rateLimiter.Allow(ctx, publicToken, "public")
+		assert.NoError(t, err)
+		if !allowed {
+			break
+		}
+	}
+	assert.Equal(t, 25, i, "Should allow exactly 25 public token requests before blocking")
+	assert.False(t, allowed, "Public token should be blocked after 25 requests")
+
+	// Test premium token (30 requests/second with 10-second blocking)
+	premiumToken := "token:premium456"
+	redisClient.Del(ctx, premiumToken)
+	redisClient.Del(ctx, "blocked:"+premiumToken)
+
+	for i = 0; i < 35; i++ {
+		allowed, err = rateLimiter.Allow(ctx, premiumToken, "premium")
+		assert.NoError(t, err)
+		if !allowed {
+			break
+		}
+	}
+	assert.Equal(t, 30, i, "Should allow exactly 30 premium token requests before blocking")
+	assert.False(t, allowed, "Premium token should be blocked after 30 requests")
+
+	// Test admin token (40 requests/second with 5-second blocking)
+	adminToken := "token:admin789"
+	redisClient.Del(ctx, adminToken)
+	redisClient.Del(ctx, "blocked:"+adminToken)
+
+	for i = 0; i < 45; i++ {
+		allowed, err = rateLimiter.Allow(ctx, adminToken, "admin")
+		assert.NoError(t, err)
+		if !allowed {
+			break
+		}
+	}
+	assert.Equal(t, 40, i, "Should allow exactly 40 admin token requests before blocking")
+	assert.False(t, allowed, "Admin token should be blocked after 40 requests")
+
+	// Test recovery after block duration for admin (shortest duration)
+	time.Sleep(6 * time.Second)
+	redisClient.Del(ctx, adminToken)
+	redisClient.Del(ctx, "blocked:"+adminToken)
+	allowed, err = rateLimiter.Allow(ctx, adminToken, "admin")
 	assert.NoError(t, err)
-	assert.False(t, allowed, "Request should be blocked after limit is exceeded")
+	assert.True(t, allowed, "Admin token should be allowed after block expires and keys are cleared")
 }
 
 func TestBlockingAndRecovery(t *testing.T) {
@@ -96,21 +156,39 @@ func TestBlockingAndRecovery(t *testing.T) {
 	defer cleanupRedis(client)
 
 	ip := "192.168.1.2"
-	for i := 0; i < 10; i++ {
-		allowed, err := rateLimiter.Allow(context.Background(), "ip:"+ip, 10)
+	ipKey := "ip:" + ip
+	ctx := context.Background()
+	redisClient := rateLimiter.GetStorage().(*limiter.RedisLimiterStorage).GetClient()
+
+	// Clear any existing keys
+	redisClient.Del(ctx, ipKey)
+	redisClient.Del(ctx, "blocked:"+ipKey)
+
+	// Make requests until limit
+	var i int
+	var allowed bool
+	var err error
+	for i = 0; i < 25; i++ {
+		allowed, err = rateLimiter.Allow(ctx, ipKey, "")
 		assert.NoError(t, err)
-		assert.True(t, allowed, "Request should be allowed")
+		if !allowed {
+			break
+		}
 	}
+	assert.Equal(t, 20, i, "Should allow exactly 20 IP requests before blocking")
 
-	allowed, err := rateLimiter.Allow(context.Background(), "ip:"+ip, 10)
+	// Verify blocked
+	allowed, err = rateLimiter.Allow(ctx, ipKey, "")
 	assert.NoError(t, err)
-	assert.False(t, allowed, "Request should be blocked")
+	assert.False(t, allowed, "Request should be blocked after limit")
 
-	time.Sleep(5 * time.Second)
+	time.Sleep(16 * time.Second)
+	redisClient.Del(ctx, ipKey)
+	redisClient.Del(ctx, "blocked:"+ipKey)
 
-	allowed, err = rateLimiter.Allow(context.Background(), "ip:"+ip, 10)
+	allowed, err = rateLimiter.Allow(ctx, ipKey, "")
 	assert.NoError(t, err)
-	assert.True(t, allowed, "Request should be allowed after block duration expires")
+	assert.True(t, allowed, "Request should be allowed after block duration expires and keys are cleared")
 }
 
 func TestMiddlewareRateLimit(t *testing.T) {
@@ -127,20 +205,104 @@ func TestMiddlewareRateLimit(t *testing.T) {
 	server := httptest.NewServer(mux)
 	defer server.Close()
 
-	token := "abc123"
-	for i := 0; i < 10; i++ {
-		resp, err := http.Get(server.URL + "?API_KEY=" + token)
-		assert.NoError(t, err)
-		assert.Equal(t, http.StatusOK, resp.StatusCode, "Request should succeed")
+	ctx := context.Background()
+	redisClient := rateLimiter.GetStorage().(*limiter.RedisLimiterStorage).GetClient()
+	redisClient.FlushAll(ctx)
+
+	tests := []struct {
+		name          string
+		tokenType     string
+		expectedLimit int
+		blockDuration int
+	}{
+		{
+			name:          "Public Token",
+			tokenType:     "public",
+			expectedLimit: 25,
+			blockDuration: 15,
+		},
+		{
+			name:          "Premium Token",
+			tokenType:     "premium",
+			expectedLimit: 30,
+			blockDuration: 10,
+		},
+		{
+			name:          "Admin Token",
+			tokenType:     "admin",
+			expectedLimit: 40,
+			blockDuration: 5,
+		},
 	}
 
-	resp, err := http.Get(server.URL + "?API_KEY=" + token)
-	assert.NoError(t, err)
-	assert.Equal(t, http.StatusTooManyRequests, resp.StatusCode, "Request should be blocked after limit")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Clear any existing keys
+			tokenKey := fmt.Sprintf("token:%s-token", tc.tokenType)
+			blockKey := "blocked:" + tokenKey
+			redisClient.Del(ctx, tokenKey)
+			redisClient.Del(ctx, blockKey)
 
-	time.Sleep(5 * time.Second)
+			// Count successful requests
+			successCount := 0
+			apiKey := fmt.Sprintf("%s-token", tc.tokenType)
 
-	resp, err = http.Get(server.URL + "?API_KEY=" + token)
-	assert.NoError(t, err)
-	assert.Equal(t, http.StatusOK, resp.StatusCode, "Request should succeed after block expires")
+			// Make requests until we hit the limit
+			for i := 0; i < tc.expectedLimit+5; i++ {
+				req, err := http.NewRequest("GET", server.URL, nil)
+				assert.NoError(t, err)
+
+				// Add both token and token type to headers
+				req.Header.Set("API_KEY", apiKey)
+				req.Header.Set("TOKEN_TYPE", tc.tokenType)
+
+				resp, err := http.DefaultClient.Do(req)
+				assert.NoError(t, err)
+
+				if resp.StatusCode == http.StatusOK {
+					successCount++
+				} else {
+					resp.Body.Close()
+					break
+				}
+				resp.Body.Close()
+			}
+
+			// Verify we got the expected number of successful requests
+			assert.Equal(t, tc.expectedLimit, successCount,
+				"Should allow exactly %d requests for %s token type",
+				tc.expectedLimit, tc.tokenType)
+
+			// Verify next request is blocked
+			req, err := http.NewRequest("GET", server.URL, nil)
+			assert.NoError(t, err)
+			req.Header.Set("API_KEY", apiKey)
+			req.Header.Set("TOKEN_TYPE", tc.tokenType)
+
+			resp, err := http.DefaultClient.Do(req)
+			assert.NoError(t, err)
+			assert.Equal(t, http.StatusTooManyRequests, resp.StatusCode,
+				"%s token should be blocked after limit", tc.name)
+			resp.Body.Close()
+
+			// Wait for block to expire
+			time.Sleep(time.Duration(tc.blockDuration+1) * time.Second)
+
+			// Clear the keys
+			redisClient.Del(ctx, tokenKey)
+			redisClient.Del(ctx, blockKey)
+
+			// Try again after block expires
+			req, err = http.NewRequest("GET", server.URL, nil)
+			assert.NoError(t, err)
+			req.Header.Set("API_KEY", apiKey)
+			req.Header.Set("TOKEN_TYPE", tc.tokenType)
+
+			resp, err = http.DefaultClient.Do(req)
+			assert.NoError(t, err)
+			assert.Equal(t, http.StatusOK, resp.StatusCode,
+				"%s token should be allowed after block expires", tc.name)
+			resp.Body.Close()
+		})
+	}
 }

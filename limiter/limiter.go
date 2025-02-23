@@ -4,14 +4,17 @@ import (
 	"context"
 	"time"
 
+	"github.com/JRRGomes/rate-limiter/config"
 	"github.com/go-redis/redis/v8"
 )
 
 type RateLimiter struct {
-	storage        LimiterStorage
-	rateLimitIP    int
-	rateLimitToken int
-	blockDuration  int
+	storage            LimiterStorage
+	rateLimitIP        int
+	blockDurationIP    int
+	rateLimitToken     int
+	blockDurationToken int
+	tokenLimits        map[string]config.RateLimitConfig
 }
 
 type RedisLimiterStorage struct {
@@ -22,12 +25,14 @@ func (r *RedisLimiterStorage) GetClient() *redis.Client {
 	return r.client
 }
 
-func NewRateLimiter(storage LimiterStorage, rateLimitIP, rateLimitToken, blockDuration int) *RateLimiter {
+func NewRateLimiter(storage LimiterStorage, cfg *config.Config) *RateLimiter {
 	return &RateLimiter{
-		storage:        storage,
-		rateLimitIP:    rateLimitIP,
-		rateLimitToken: rateLimitToken,
-		blockDuration:  blockDuration,
+		storage:            storage,
+		rateLimitIP:        cfg.RateLimitIP,
+		blockDurationIP:    cfg.BlockDurationIP,
+		rateLimitToken:     cfg.RateLimitToken,
+		blockDurationToken: cfg.BlockDurationToken,
+		tokenLimits:        cfg.TokenLimits,
 	}
 }
 
@@ -35,8 +40,7 @@ func NewRedisLimiterStorage(client *redis.Client) *RedisLimiterStorage {
 	return &RedisLimiterStorage{client: client}
 }
 
-func (r *RateLimiter) Allow(ctx context.Context, key string, limit int) (bool, error) {
-	// Check if the key is blocked
+func (r *RateLimiter) Allow(ctx context.Context, key string, tokenType string) (bool, error) {
 	blocked, err := r.storage.IsBlocked(ctx, key)
 	if err != nil {
 		return false, err
@@ -45,23 +49,30 @@ func (r *RateLimiter) Allow(ctx context.Context, key string, limit int) (bool, e
 		return false, nil
 	}
 
-	// Increment and check if the key exceeds the limit
+	var limit int
+	var blockDuration int
+
+	if tokenType == "" {
+		limit = r.rateLimitIP
+		blockDuration = r.blockDurationIP
+	} else {
+		if config, exists := r.tokenLimits[tokenType]; exists {
+			limit = config.Limit
+			blockDuration = config.BlockDuration
+		} else {
+			limit = r.rateLimitToken
+			blockDuration = r.blockDurationToken
+		}
+	}
+
 	count, err := r.storage.Increment(ctx, key, 1)
 	if err != nil {
 		return false, err
 	}
 
-	// If the count exceeds the limit, block the key
 	if int(count) > limit {
-		err := r.storage.Block(ctx, key, r.blockDuration)
-		if err != nil {
-			return false, err
-		}
-		// Reset the request count after blocking
-		err = r.storage.Reset(ctx, key)
-		if err != nil {
-			return false, err
-		}
+		_ = r.storage.Block(ctx, key, blockDuration)
+		_ = r.storage.Reset(ctx, key)
 		return false, nil
 	}
 
@@ -81,7 +92,6 @@ func (r *RedisLimiterStorage) IsBlocked(ctx context.Context, key string) (bool, 
 }
 
 func (r *RedisLimiterStorage) Increment(ctx context.Context, key string, value int) (int64, error) {
-	// Increment the value for the key in Redis
 	count, err := r.client.IncrBy(ctx, key, int64(value)).Result()
 	if err != nil {
 		return 0, err
@@ -92,10 +102,7 @@ func (r *RedisLimiterStorage) Increment(ctx context.Context, key string, value i
 func (r *RedisLimiterStorage) Block(ctx context.Context, key string, duration int) error {
 	blockKey := "blocked:" + key
 	_, err := r.client.Set(ctx, blockKey, "1", time.Duration(duration)*time.Second).Result()
-	if err != nil {
-		return err
-	}
-	return nil
+	return err
 }
 
 func (r *RateLimiter) GetStorage() LimiterStorage {

@@ -14,24 +14,25 @@ func Middleware(rateLimiter *RateLimiter) func(http.Handler) http.Handler {
 			token := r.Header.Get("API_KEY")
 
 			var key string
-			var limit int
+			var tokenType string
 
 			if token != "" {
 				key = "token:" + token
-				limit = rateLimiter.rateLimitToken
+				tokenType = r.Header.Get("TOKEN_TYPE")
+				if tokenType == "" {
+					tokenType = "public"
+				}
 			} else {
 				key = "ip:" + ip
-				limit = rateLimiter.rateLimitIP
+				tokenType = ""
 			}
 
-			// Verifica bloqueio
 			if blocked, _ := rateLimiter.storage.IsBlocked(ctx, key); blocked {
 				http.Error(w, "you have reached the maximum number of requests or actions allowed within a certain time frame", http.StatusTooManyRequests)
 				return
 			}
 
-			// Verifica limite
-			allowed, _ := rateLimiter.Allow(ctx, key, limit)
+			allowed, _ := rateLimiter.Allow(ctx, key, tokenType)
 			if !allowed {
 				http.Error(w, "you have reached the maximum number of requests or actions allowed within a certain time frame", http.StatusTooManyRequests)
 				return

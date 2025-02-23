@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"net/http"
+	"os"
 
 	"github.com/JRRGomes/rate-limiter/config"
 	"github.com/JRRGomes/rate-limiter/limiter"
@@ -11,15 +12,32 @@ import (
 )
 
 func main() {
-	// Load environment variables from .env file
-	if err := godotenv.Load("../.env"); err != nil {
-		log.Fatal("Error loading .env file")
+	if err := godotenv.Load(".env"); err != nil {
+		if err := godotenv.Load("../.env"); err != nil {
+			log.Println("No .env file found, using environment variables")
+		}
 	}
 
 	// Load configuration
 	cfg, err := config.LoadConfig()
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
+	}
+
+	redisHost := cfg.RedisHost
+	if redisHost == "" {
+		redisHost = os.Getenv("REDIS_HOST")
+		if redisHost == "" {
+			redisHost = "localhost"
+		}
+	}
+
+	redisPort := cfg.RedisPort
+	if redisPort == "" {
+		redisPort = os.Getenv("REDIS_PORT")
+		if redisPort == "" {
+			redisPort = "6379"
+		}
 	}
 
 	// Initialize Redis client
@@ -31,7 +49,7 @@ func main() {
 
 	// Initialize RedisStorage and RateLimiter
 	storage := limiter.NewRedisLimiterStorage(client)
-	rateLimiter := limiter.NewRateLimiter(storage, cfg.RateLimitIP, cfg.RateLimitToken, cfg.BlockDuration)
+	rateLimiter := limiter.NewRateLimiter(storage, cfg)
 
 	// Create HTTP server with rate limiting middleware
 	mux := http.NewServeMux()
